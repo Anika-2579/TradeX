@@ -1,0 +1,387 @@
+using cAlgo.API;
+using cAlgo.API.Internals;
+using System;
+using System.Linq;
+
+namespace cAlgo.Robots
+{
+    // Note: Attach this bot to a 3-minute GBPUSD chart for correct operation
+    [Robot(TimeZone = TimeZones.EasternStandardTime, AccessRights = AccessRights.None)]
+    public class TradeXDisplacementBot : Robot
+    {
+        [Parameter("Risk %", DefaultValue = 1.0, MinValue = 0.1)]
+        public double RiskPercent { get; set; }
+
+        [Parameter("Reward R", DefaultValue = 2.0, MinValue = 1.0)]
+        public double RewardR { get; set; }
+
+        [Parameter("Min Sweep Pips", DefaultValue = 5.0, MinValue = 0.0)]
+        public double MinSweepPips { get; set; }
+
+        [Parameter("Max Spread Pips", DefaultValue = 6.0, MinValue = 0.0)]
+        public double MaxSpreadPips { get; set; }
+
+        [Parameter("Max Slippage Pips", DefaultValue = 2.0, MinValue = 0.0)]
+        public double MaxSlippagePips { get; set; }
+
+        [Parameter("Auto-Lot Multiplier", DefaultValue = 1.0, MinValue = 0.0)]
+        public double AutoLotMultiplier { get; set; }
+
+        [Parameter("Debug Mode", DefaultValue = true)]
+        public bool DebugMode { get; set; }
+
+        private bool tradePlaced = false;
+        private bool shortSweepDetected = false;
+        private bool longSweepDetected = false;
+        private double hourlyHigh = 0.0;
+        private double hourlyLow = 0.0;
+        private double prevHourlyHigh = 0.0;
+        private double prevHourlyLow = 0.0;
+        private double initialBalance;
+
+        // Helper method to check if current date is in US DST (approximate)
+        private bool IsInDST(DateTime date)
+        {
+            // US DST: Second Sunday in March to first Sunday in November
+            var year = date.Year;
+            var dstStart = new DateTime(year, 3, 8, 2, 0, 0).AddDays(6 - (int)new DateTime(year, 3, 8).DayOfWeek); // Second Sunday
+            var dstEnd = new DateTime(year, 11, 1, 2, 0, 0).AddDays(6 - (int)new DateTime(year, 11, 1).DayOfWeek); // First Sunday
+            return date >= dstStart && date < dstEnd;
+        }
+
+        protected override void OnStart()
+        {
+            // Restrict to GBPUSD
+            if (Symbol.Name != "GBPUSD")
+            {
+                Print("Error: This bot is configured for GBPUSD only. Current symbol: {0}. Stopping bot.", Symbol.Name);
+                Stop();
+                return;
+            }
+
+            // Verify 3-minute chart
+            if (MarketData.GetBars(TimeFrame.Minute3).TimeFrame != TimeFrame.Minute3)
+            {
+                Print("Error: This bot requires a 3-minute chart. Stopping bot.");
+                Stop();
+                return;
+            }
+
+            initialBalance = Account.Balance;
+            Print("TradeXDisplacementBot initialized. Symbol: GBPUSD, TimeZone: US Eastern (EST/EDT), Initial Balance: {0}, Risk: {1}%, Reward: {2}R, Min Sweep: {3} pips, Max Spread: {4} pips, Max Slippage: {5} pips, Auto-Lot Multiplier: {6}, Debug: {7}",
+                initialBalance, RiskPercent, RewardR, MinSweepPips, MaxSpreadPips, MaxSlippagePips, AutoLotMultiplier, DebugMode);
+
+            // Check server timezone alignment
+            var serverTime = Server.Time;
+            var expectedUtcOffset = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time").GetUtcOffset(serverTime).TotalHours;
+            Print("Server Time: {0}, Expected UTC Offset: {1} hours", serverTime, expectedUtcOffset);
+            if (Math.Abs(expectedUtcOffset + (IsInDST(serverTime) ? 4 : 5)) > 2 && DebugMode)
+                Print("Warning: Server timezone may not align with US Eastern (EST/EDT). Verify broker settings.");
+
+            // Initialize previous hourly candle data
+            var hourly = MarketData.GetBars(TimeFrame.Hour);
+            if (hourly.Count < 2)
+            {
+                Print("Error: Insufficient hourly bars to initialize. Stopping bot.");
+                Stop();
+                return;
+            }
+
+            var prevBar = hourly.Last(2); // 9–10 AM candle (US Eastern)
+            prevHourlyHigh = prevBar.High;
+            prevHourlyLow = prevBar.Low;
+            Print("Initialized 9–10 AM candle. High: {0}, Low: {1}", prevHourlyHigh, prevHourlyLow);
+        }
+
+        protected override void OnTick()
+        {
+            var timeNow = Server.Time;
+            var currentDay = timeNow.DayOfWeek;
+
+            // Adjust trading hour for DST (10 AM EDT = 11 AM EST)
+            int tradingHour = IsInDST(timeNow) ? 10 : 11;
+
+            // Reset state at the start of a new day
+            if (timeNow.Hour == 0 && timeNow.Minute == 0)
+            {
+                tradePlaced = false;
+                shortSweepDetected = false;
+                longSweepDetected = false;
+                hourlyHigh = 0.0;
+                hourlyLow = 0.0;
+                Print("Daily reset at {0}. Ready for new trading day.", timeNow);
+            }
+
+            // Skip if invalid conditions
+            if (currentDay == DayOfWeek.Monday || currentDay == DayOfWeek.Friday || tradePlaced || timeNow.Hour != tradingHour)
+                return;
+
+            // Validate account conditions
+            if (Account.Balance <= 0 || Account.Equity <= 0 || !Account.IsLive)
+            {
+                Print("Error: Invalid account conditions. Balance: {0}, Equity: {1}, IsLive: {2}", 
+                    Account.Balance, Account.Equity, Account.IsLive);
+                return;
+            }
+
+            var hourly = MarketData.GetBars(TimeFrame.Hour);
+            if (hourly.Count < 2)
+            {
+                Print("Error: Insufficient hourly bars during OnTick.");
+                return;
+            }
+
+            var currentBar = hourly.Last(1); // 10–11 AM candle (forming)
+
+            // Update current 10–11 AM candle high/low
+            hourlyHigh = Math.Max(hourlyHigh, currentBar.High);
+            hourlyLow = hourlyLow == 0.0 ? currentBar.Low : Math.Min(hourlyLow, currentBar.Low);
+
+            // Check for sweeps in real-time
+            if (!shortSweepDetected && currentBar.High > prevHourlyHigh)
+            {
+                double sweepSizePips = (currentBar.High - prevHourlyHigh) / Symbol.PipSize;
+                if (sweepSizePips >= MinSweepPips)
+                {
+                    shortSweepDetected = true;
+                    Print("Hourly high sweep detected at {0}. High: {1}, Sweep Size: {2} pips", 
+                        timeNow, hourlyHigh, sweepSizePips);
+                }
+                else if (DebugMode)
+                {
+                    Print("High sweep too small: {0} pips (Min: {1} pips)", sweepSizePips, MinSweepPips);
+                }
+            }
+
+            if (!longSweepDetected && currentBar.Low < prevHourlyLow)
+            {
+                double sweepSizePips = (prevHourlyLow - currentBar.Low) / Symbol.PipSize;
+                if (sweepSizePips >= MinSweepPips)
+                {
+                    longSweepDetected = true;
+                    Print("Hourly low sweep detected at {0}. Low: {1}, Sweep Size: {2} pips", 
+                        timeNow, hourlyLow, sweepSizePips);
+                }
+                else if (DebugMode)
+                {
+                    Print("Low sweep too small: {0} pips (Min: {1} pips)", sweepSizePips, MinSweepPips);
+                }
+            }
+        }
+
+        protected override void OnBar()
+        {
+            var timeNow = Server.Time;
+            // Adjust trading hour for DST (10 AM EDT = 11 AM EST)
+            int tradingHour = IsInDST(timeNow) ? 10 : 11;
+
+            if (tradePlaced || timeNow.Hour != tradingHour)
+                return;
+
+            var threeMinuteBars = MarketData.GetBars(TimeFrame.Minute3);
+            if (threeMinuteBars.Count < 3)
+            {
+                Print("Error: Insufficient 3-minute bars.");
+                return;
+            }
+
+            var lastThreeBars = threeMinuteBars.TakeLast(3).ToList();
+            if (lastThreeBars.Count != 3)
+                return;
+
+            if (DebugMode)
+            {
+                Print("Checking 3-minute candles at {0}. Bar 1: O={1}, C={2}; Bar 2: O={3}, C={4}; Bar 3: O={5}, C={6}",
+                    Server.Time, 
+                    lastThreeBars[0].Open, lastThreeBars[0].Close,
+                    lastThreeBars[1].Open, lastThreeBars[1].Close,
+                    lastThreeBars[2].Open, lastThreeBars[2].Close);
+            }
+
+            // Check spread before trading
+            double currentSpreadPips = (Symbol.Ask - Symbol.Bid) / Symbol.PipSize;
+            if (currentSpreadPips > MaxSpreadPips)
+            {
+                Print("Trade skipped: Current spread ({0} pips) exceeds maximum ({1} pips).", 
+                    currentSpreadPips, MaxSpreadPips);
+                return;
+            }
+
+            // Short trade: Three consecutive bearish 3-minute candles
+            if (shortSweepDetected &&
+                lastThreeBars[0].Close < lastThreeBars[0].Open &&
+                lastThreeBars[1].Close < lastThreeBars[1].Open &&
+                lastThreeBars[2].Close < lastThreeBars[2].Open)
+            {
+                ExecuteShortTrade(currentSpreadPips);
+            }
+            // Long trade: Three consecutive bullish 3-minute candles
+            else if (longSweepDetected &&
+                     lastThreeBars[0].Close > lastThreeBars[0].Open &&
+                     lastThreeBars[1].Close > lastThreeBars[1].Open &&
+                     lastThreeBars[2].Close > lastThreeBars[2].Open)
+            {
+                ExecuteLongTrade(currentSpreadPips);
+            }
+        }
+
+        private void ExecuteShortTrade(double currentSpreadPips)
+        {
+            double expectedEntry = Symbol.Bid;
+            double sl = hourlyHigh;
+            double riskPips = (sl - expectedEntry) / Symbol.PipSize;
+            double tp = expectedEntry - (riskPips * RewardR * Symbol.PipSize);
+
+            // Validate trade parameters
+            if (riskPips <= 0)
+            {
+                Print("Invalid short trade: Stop loss ({0}) is below entry ({1}).", sl, expectedEntry);
+                return;
+            }
+
+            long volume = GetVolume(riskPips);
+            if (volume <= 0)
+            {
+                Print("Invalid short trade: Volume is zero or negative.");
+                return;
+            }
+
+            if (tp >= expectedEntry || tp <= 0)
+            {
+                Print("Invalid short trade: Take profit ({0}) is invalid for entry ({1}).", tp, expectedEntry);
+                return;
+            }
+
+            var result = ExecuteMarketOrder(TradeType.Sell, Symbol.Name, volume, "TradeXShort", riskPips, tp);
+            if (result.IsSuccessful && result.Position != null)
+            {
+                double actualEntry = result.Position.EntryPrice;
+                double slippagePips = Math.Abs(actualEntry - expectedEntry) / Symbol.PipSize;
+                if (slippagePips > MaxSlippagePips)
+                {
+                    Print("Excessive slippage detected: {0} pips (Max: {1} pips). Closing trade.", 
+                        slippagePips, MaxSlippagePips);
+                    ClosePosition(result.Position);
+                    return;
+                }
+
+                tradePlaced = true;
+                shortSweepDetected = false;
+                Print("Short Trade Placed. Entry: {0}, SL: {1}, TP: {2}, Volume: {3}, Spread: {4} pips, Slippage: {5} pips, Time: {6}",
+                    actualEntry, sl, tp, volume, currentSpreadPips, slippagePips, Server.Time);
+            }
+            else
+            {
+                Print("Short Trade Failed: {0}", result.Error);
+            }
+        }
+
+        private void ExecuteLongTrade(double currentSpreadPips)
+        {
+            double expectedEntry = Symbol.Ask;
+            double sl = hourlyLow;
+            double riskPips = (expectedEntry - sl) / Symbol.PipSize;
+            double tp = expectedEntry + (riskPips * RewardR * Symbol.PipSize);
+
+            // Validate trade parameters
+            if (riskPips <= 0)
+            {
+                Print("Invalid long trade: Stop loss ({0}) is above entry ({1}).", sl, expectedEntry);
+                return;
+            }
+
+            long volume = GetVolume(riskPips);
+            if (volume <= 0)
+            {
+                Print("Invalid long trade: Volume is zero or negative.");
+                return;
+            }
+
+            if (tp <= expectedEntry)
+            {
+                Print("Invalid long trade: Take profit ({0}) is invalid for entry ({1}).", tp, expectedEntry);
+                return;
+            }
+
+            var result = ExecuteMarketOrder(TradeType.Buy, Symbol.Name, volume, "TradeXLong", riskPips, tp);
+            if (result.IsSuccessful && result.Position != null)
+            {
+                double actualEntry = result.Position.EntryPrice;
+                double slippagePips = Math.Abs(actualEntry - expectedEntry) / Symbol.PipSize;
+                if (slippagePips > MaxSlippagePips)
+                {
+                    Print("Excessive slippage detected: {0} pips (Max: {1} pips). Closing trade.", 
+                        slippagePips, MaxSlippagePips);
+                    ClosePosition(result.Position);
+                    return;
+                }
+
+                tradePlaced = true;
+                longSweepDetected = false;
+                Print("Long Trade Placed. Entry: {0}, SL: {1}, TP: {2}, Volume: {3}, Spread: {4} pips, Slippage: {5} pips, Time: {6}",
+                    actualEntry, sl, tp, volume, currentSpreadPips, slippagePips, Server.Time);
+            }
+            else
+            {
+                Print("Long Trade Failed: {0}", result.Error);
+            }
+        }
+
+        private long GetVolume(double stopLossPips)
+        {
+            if (stopLossPips <= 0)
+            {
+                Print("Error: Invalid stop loss pips: {0}", stopLossPips);
+                return 0;
+            }
+
+            // Apply auto-lot multiplier based on account growth
+            double balanceRatio = Account.Balance / initialBalance;
+            double adjustedRiskPercent = RiskPercent * (1 + AutoLotMultiplier * (balanceRatio - 1));
+            double riskAmount = Account.Balance * (adjustedRiskPercent / 100);
+
+            double pipValue = Symbol.PipValue;
+            if (pipValue <= 0)
+            {
+                Print("Error: Invalid pip value: {0}", pipValue);
+                return 0;
+            }
+
+            // Cross-check pip value with tick value
+            double tickValue = Symbol.TickValue;
+            if (Math.Abs(pipValue - tickValue) > 0.0001 && DebugMode)
+            {
+                Print("Warning: Pip value ({0}) differs from tick value ({1}). Verify broker settings.", 
+                    pipValue, tickValue);
+            }
+
+            double volume = riskAmount / (stopLossPips * pipValue);
+            long volumeInUnits = (long)Symbol.NormalizeVolumeInUnits(volume, RoundingMode.ToNearest);
+
+            if (volumeInUnits < Symbol.VolumeInUnitsMin)
+            {
+                Print("Warning: Calculated volume ({0}) below minimum ({1}).", volumeInUnits, Symbol.VolumeInUnitsMin);
+                return 0;
+            }
+
+            if (volumeInUnits > Symbol.VolumeInUnitsMax)
+            {
+                Print("Warning: Calculated volume ({0}) exceeds maximum ({1}).", volumeInUnits, Symbol.VolumeInUnitsMax);
+                return (long)Symbol.VolumeInUnitsMax;
+            }
+
+            if (DebugMode)
+            {
+                Print("Volume Calculation: Initial Risk: {0}%, Adjusted Risk: {1}%, Risk Amount: {2}, Stop Loss: {3} pips, Pip Value: {4}, Volume: {5} units, Lot Step: {6}",
+                    RiskPercent, adjustedRiskPercent, riskAmount, stopLossPips, pipValue, volumeInUnits, Symbol.VolumeInUnitsStep);
+            }
+
+            return volumeInUnits;
+        }
+
+        protected override void OnStop()
+        {
+            Print("TradeXDisplacementBot stopped.");
+        }
+    }
+}
